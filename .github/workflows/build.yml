@@ -1,37 +1,102 @@
 name: build-fai-base
-run-name: fai-base ${{ inputs.fai_version }}
+run-name: fai-base ${{ inputs.fai_version || 'new stable fai releases' }}
 on:
+  # Every hour: build the image for any stable @fathym/fai release that does not have one yet.
+  # Schedules fire from the default branch (main) only. GitHub pauses a public repo's schedule
+  # after 60 days with no repository activity: `gh workflow enable build.yml --repo fathym/fai-base`.
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       fai_version:
-        description: 'The @fathym/fai version to pre-install, e.g. 0.0.888. Builds ghcr.io/fathym/fai-base:<version>.'
-        required: true
+        description: 'A @fathym/fai version to (re)build, e.g. 0.0.900 or a prerelease. Builds ghcr.io/fathym/fai-base:<version>. Empty: do what the hourly schedule does, build every recent stable release that has no image yet.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
   packages: write
 
-# One build per fai version at a time; a second dispatch of the same version waits.
-concurrency:
-  group: build-fai-base-${{ inputs.fai_version }}
-  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/fathym/fai-base
+  # A stable release older than this is not looked at by the schedule (dispatch it by version instead).
+  WINDOW_DAYS: '7'
 
 jobs:
-  build:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+    steps:
+      - name: Which versions need an image
+        id: plan
+        env:
+          FAI_VERSION: ${{ inputs.fai_version }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The version becomes an image tag and a jsr: specifier: only a semantic version passes.
+          SEMVER='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+          if [ -n "$FAI_VERSION" ]; then
+            if ! printf '%s' "$FAI_VERSION" | grep -Eq "$SEMVER"; then
+              echo "Not a fai version: $FAI_VERSION"
+              exit 1
+            fi
+            # Asked for by name: always build, so a dispatch can rebuild a tag on purpose.
+            echo "versions=$(jq -cn --arg v "$FAI_VERSION" '[$v]')" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stable releases only (no '-'): JSR's latest, plus any published in the window.
+          since=$(date -u -d "-${WINDOW_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          candidates=$(curl -fsS https://jsr.io/@fathym/fai/meta.json | jq -r --arg since "$since" '
+            .latest as $latest
+            | .versions | to_entries[]
+            | select(.key | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+            | select(.value.yanked != true)
+            | select(.key == $latest or .value.createdAt >= $since)
+            | .key')
+          echo "Stable fai releases looked at: ${candidates:-none}"
+
+          # A registry token from this run's GITHUB_TOKEN.
+          reg=$(curl -fsS -u "$GH_ACTOR:$GH_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:fathym/fai-base:pull" | jq -r .token)
+          echo "::add-mask::$reg"
+
+          missing=()
+          for v in $candidates; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer $reg" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/fathym/fai-base/manifests/$v")
+            case "$code" in
+              200) echo "$IMAGE:$v exists" ;;
+              404) echo "$IMAGE:$v is missing"; missing+=("$v") ;;
+              # Anything else is not an answer: fail rather than guess.
+              *) echo "Could not read $IMAGE:$v (HTTP $code)"; exit 1 ;;
+            esac
+          done
+
+          echo "versions=$(printf '%s\n' "${missing[@]}" | jq -Rcs 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        fai_version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    # One build per fai version at a time; a second build of the same version waits.
+    concurrency:
+      group: build-fai-base-${{ matrix.fai_version }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Check the version
-        # The version becomes an image tag and a jsr: specifier: only a semantic version passes.
-        env:
-          FAI_VERSION: ${{ inputs.fai_version }}
-        run: |
-          if ! printf '%s' "$FAI_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "Not a fai version: $FAI_VERSION"
-            exit 1
-          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -44,9 +109,14 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          build-args: FAI_VERSION=${{ inputs.fai_version }}
+          build-args: FAI_VERSION=${{ matrix.fai_version }}
           push: true
-          tags: ghcr.io/fathym/fai-base:${{ inputs.fai_version }}
+          tags: ${{ env.IMAGE }}:${{ matrix.fai_version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Deno and the fai CLI, pre-installed at one fai version
+
+      - name: Read the pushed tag back from the registry
+        env:
+          TAG: ${{ env.IMAGE }}:${{ matrix.fai_version }}
+        run: docker buildx imagetools inspect "$TAG"
